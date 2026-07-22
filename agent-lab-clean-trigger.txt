@@ -1,0 +1,1 @@
+Run the isolated OpenClaw benchmark from a clean branch based on current main.

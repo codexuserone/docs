@@ -1,0 +1,1 @@
+[Download relayed GGUF](https://v5.airtableusercontent.com/v3/u/55/55/1784779200000/ZsEIXAJjx5L25d-E2Q-o2w/lJf3nXUrgbpGflcGIvLJN6-dUD_scXFUtYCl5P-polVdlot5lF10r9kQ3Schz-OJZmEhJQlQHK18-ERLEWhxORu0-gMU2Du5mHjVy66IWbot_3ovzRmIE7K4n4jb6-gE6WeA4Ab2-eOBFO3KNOWOIQ/gnQQ7Vm9090q1wC40KtxMFMPuiAuBywivjgM84sbgao)

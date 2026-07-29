@@ -1,0 +1,213 @@
+name: Extract CJH scan IE1665279
+
+on:
+  push:
+    branches:
+      - artifact/cjh-ie1665279
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pillow img2pdf
+
+      - name: Download and convert scan
+        shell: bash
+        run: |
+          cat > /tmp/extract_cjh.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import parse_qs, urljoin, urlparse
+
+          import img2pdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageOps
+
+          TOP_URL = "https://digipres.cjh.org/delivery/DeliveryManagerServlet?dps_pid=IE1665279"
+          EXPECTED_IDS = [
+              "FL1665281", "FL1665282", "FL1665284", "FL1665286", "FL1665288",
+              "FL1665290", "FL1665292", "FL1665294", "FL1665297", "FL1665298",
+              "FL1665300", "FL1665302", "FL1665304", "FL1665305", "FL1665307",
+              "FL1665308", "FL1665310", "FL1665312",
+          ]
+          LABELS = [
+              "Front cover", "Title page", "Page 2", "Page 3", "Page 4", "Page 5",
+              "Page 6", "Page 7", "Page 8", "Page 9", "Page 10", "Page 11",
+              "Page 12", "Page 13", "Page 14", "Page 15", "Page 16", "Back cover",
+          ]
+
+          out = Path("artifact")
+          originals = out / "original_pages"
+          images = out / "images_jpg"
+          originals.mkdir(parents=True, exist_ok=True)
+          images.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9",
+          })
+
+          landing = session.get(TOP_URL, timeout=90)
+          landing.raise_for_status()
+          soup = BeautifulSoup(landing.text, "html.parser")
+          iframe = soup.find("iframe")
+          if iframe is None or not iframe.get("src"):
+              raise RuntimeError("The CJH landing page did not expose its viewer iframe.")
+
+          viewer_url = urljoin(TOP_URL, iframe["src"])
+          query = parse_qs(urlparse(viewer_url).query)
+          dvs = query.get("dps_dvs", [None])[0]
+          if not dvs:
+              raise RuntimeError("The CJH viewer did not provide a delivery-session ID.")
+
+          viewer = session.get(viewer_url, timeout=90)
+          viewer.raise_for_status()
+          discovered = []
+          for pid in re.findall(r"FL\d+", viewer.text):
+              if pid not in discovered:
+                  discovered.append(pid)
+          page_ids = [pid for pid in EXPECTED_IDS if pid in discovered]
+          if len(page_ids) != 18:
+              raise RuntimeError(
+                  f"Expected all 18 page files, but the active session exposed {len(page_ids)}: {page_ids}"
+              )
+
+          records = []
+          jpg_paths = []
+          for number, (pid, label) in enumerate(zip(page_ids, LABELS), start=1):
+              download_url = (
+                  "https://digipres.cjh.org/delivery/DeliveryManagerServlet"
+                  f"?dps_func=download&dps_pid={pid}&dps_dvs={dvs}"
+              )
+              response = session.get(
+                  download_url,
+                  headers={"Referer": viewer_url, "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"},
+                  timeout=180,
+                  allow_redirects=True,
+              )
+              response.raise_for_status()
+              content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+              body_start = response.content[:500].lower()
+              if "text/html" in content_type or b"delivery not allowed" in body_start or b"login" in body_start:
+                  raise RuntimeError(f"Archive refused page {number} ({pid}) inside the active session.")
+
+              ext_map = {
+                  "image/jpeg": ".jpg",
+                  "image/jp2": ".jp2",
+                  "image/tiff": ".tif",
+                  "image/png": ".png",
+                  "application/pdf": ".pdf",
+              }
+              ext = ext_map.get(content_type, ".bin")
+              original_path = originals / f"page_{number:02d}_{pid}{ext}"
+              original_path.write_bytes(response.content)
+
+              try:
+                  with Image.open(io.BytesIO(response.content)) as im:
+                      im.seek(0)
+                      im = ImageOps.exif_transpose(im)
+                      if im.mode not in ("RGB", "L"):
+                          if "A" in im.mode:
+                              background = Image.new("RGB", im.size, "white")
+                              alpha = im.getchannel("A")
+                              background.paste(im.convert("RGB"), mask=alpha)
+                              im = background
+                          else:
+                              im = im.convert("RGB")
+                      elif im.mode == "L":
+                          im = im.convert("RGB")
+                      jpg_path = images / f"page_{number:02d}.jpg"
+                      im.save(jpg_path, "JPEG", quality=97, subsampling=0, optimize=True, dpi=(300, 300))
+                      width, height = im.size
+              except Exception as exc:
+                  raise RuntimeError(f"Could not decode page {number} ({pid}), type {content_type}: {exc}") from exc
+
+              jpg_paths.append(jpg_path)
+              records.append({
+                  "page": number,
+                  "label": label,
+                  "file_pid": pid,
+                  "content_type": content_type,
+                  "original_bytes": len(response.content),
+                  "jpg_bytes": jpg_path.stat().st_size,
+                  "width": width,
+                  "height": height,
+                  "sha256": hashlib.sha256(response.content).hexdigest(),
+              })
+              print(f"Downloaded {number:02d}/18 {pid}: {content_type}, {width}x{height}")
+
+          pdf_path = out / "A_kind_in_tfiseh.pdf"
+          with pdf_path.open("wb") as pdf_file:
+              pdf_file.write(img2pdf.convert([str(path) for path in jpg_paths]))
+
+          (out / "manifest.json").write_text(
+              json.dumps(
+                  {
+                      "title": "A kind in tfiseh",
+                      "source": TOP_URL,
+                      "viewer": viewer_url,
+                      "pages": records,
+                  },
+                  ensure_ascii=False,
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+
+          images_zip = out / "A_kind_in_tfiseh_images.zip"
+          with zipfile.ZipFile(images_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in jpg_paths:
+                  zf.write(path, arcname=path.name)
+              zf.write(out / "manifest.json", arcname="manifest.json")
+
+          complete_zip = out / "A_kind_in_tfiseh_complete.zip"
+          with zipfile.ZipFile(complete_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              zf.write(pdf_path, arcname=pdf_path.name)
+              zf.write(images_zip, arcname=images_zip.name)
+              zf.write(out / "manifest.json", arcname="manifest.json")
+
+          print(json.dumps({
+              "pdf_bytes": pdf_path.stat().st_size,
+              "images_zip_bytes": images_zip.stat().st_size,
+              "complete_zip_bytes": complete_zip.stat().st_size,
+              "pages": len(jpg_paths),
+          }, indent=2))
+          PY
+          python /tmp/extract_cjh.py
+
+      - name: Upload converted files
+        uses: actions/upload-artifact@v4
+        with:
+          name: A_kind_in_tfiseh_converted
+          path: |
+            artifact/A_kind_in_tfiseh.pdf
+            artifact/A_kind_in_tfiseh_images.zip
+            artifact/A_kind_in_tfiseh_complete.zip
+            artifact/manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
